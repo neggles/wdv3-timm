@@ -12,6 +12,7 @@ from PIL import Image
 from simple_parsing import field, parse_known_args
 from timm.data import create_transform, resolve_data_config
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_REPO_MAP = {
@@ -123,7 +124,7 @@ def main(opts: ScriptOptions):
         raise FileNotFoundError(f"Image file not found: {image_path}")
 
     print(f"Loading model '{opts.model}' from '{repo_id}'...")
-    model: nn.Module = timm.list_pretrained("hf-hub:" + repo_id).eval()
+    model: nn.Module = timm.create_model("hf-hub:" + repo_id).eval()
     state_dict = timm.models.load_state_dict_from_hf(repo_id)
     model.load_state_dict(state_dict)
 
@@ -151,6 +152,8 @@ def main(opts: ScriptOptions):
             inputs = inputs.to(torch_device)
         # run the model
         outputs = model.forward(inputs)
+        # apply final activation
+        outputs = F.sigmoid(outputs)
         # move inputs, outputs, and model back to to cpu if we were on GPU
         if torch_device.type != "cpu":
             inputs = inputs.to("cpu")
