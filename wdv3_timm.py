@@ -143,6 +143,8 @@ def main(opts: ScriptOptions):
     img_input = pil_pad_square(img_input)
     # run the model's input transform to convert to tensor and rescale
     inputs: Tensor = transform(img_input).unsqueeze(0)
+    # NCHW image RGB to BGR
+    inputs = inputs[:, [2, 1, 0]]
 
     print("Running inference...")
     with torch.inference_mode():
