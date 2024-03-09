@@ -141,6 +141,8 @@ def main(opts: ScriptOptions):
     img_input = pil_ensure_rgb(img_input)
     # pad to square with white background
     img_input = pil_pad_square(img_input)
+    # make it be BGR because OpenCV curses
+    img_input = img_input.convert("BGR;24")
     # run the model's input transform to convert to tensor and rescale
     inputs: Tensor = transform(img_input).unsqueeze(0)
 
