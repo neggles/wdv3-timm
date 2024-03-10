@@ -12,6 +12,7 @@ from PIL import Image
 from simple_parsing import field, parse_known_args
 from timm.data import create_transform, resolve_data_config
 from torch import Tensor, nn
+from torch.nn import functional as F
 
 torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_REPO_MAP = {
@@ -155,6 +156,8 @@ def main(opts: ScriptOptions):
             inputs = inputs.to(torch_device)
         # run the model
         outputs = model.forward(inputs)
+        # apply the final activation function (timm doesn't support doing this internally)
+        outputs = F.sigmoid(outputs)
         # move inputs, outputs, and model back to to cpu if we were on GPU
         if torch_device.type != "cpu":
             inputs = inputs.to("cpu")
