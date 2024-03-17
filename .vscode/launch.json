@@ -1,0 +1,19 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "vit",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "wdv3_timm.py",
+            "args": [
+              "images/111530159_p0.png",
+              "vit"],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}

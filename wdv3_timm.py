@@ -13,6 +13,7 @@ from simple_parsing import field, parse_known_args
 from timm.data import create_transform, resolve_data_config
 from torch import Tensor, nn
 from torch.nn import functional as F
+import cv2
 
 torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_REPO_MAP = {
@@ -124,45 +125,76 @@ def main(opts: ScriptOptions):
         raise FileNotFoundError(f"Image file not found: {image_path}")
 
     print(f"Loading model '{opts.model}' from '{repo_id}'...")
-    model: nn.Module = timm.list_pretrained("hf-hub:" + repo_id).eval()
-    state_dict = timm.models.load_state_dict_from_hf(repo_id)
-    model.load_state_dict(state_dict)
+    model = timm.create_model("hf-hub:" + repo_id, pretrained=True).eval()
 
     print("Loading tag list...")
     labels: LabelData = load_labels_hf(repo_id=repo_id)
 
     print("Creating data transform...")
+    model.pretrained_cfg['crop_mode'] = 'border'
     transform = create_transform(**resolve_data_config(model.pretrained_cfg, model=model))
+
 
     print("Loading image and preprocessing...")
     # get image
     img_input: Image.Image = Image.open(image_path)
     # ensure image is RGB
     img_input = pil_ensure_rgb(img_input)
-    # pad to square with white background
-    img_input = pil_pad_square(img_input)
-    # make it be BGR because OpenCV curses
-    img_input = img_input.convert("BGR;24")
+
     # run the model's input transform to convert to tensor and rescale
     inputs: Tensor = transform(img_input).unsqueeze(0)
-    # NCHW image RGB to BGR
-    inputs = inputs[:, [2, 1, 0]]
+
 
     print("Running inference...")
-    with torch.inference_mode():
-        # move model to GPU, if available
-        if torch_device.type != "cpu":
-            model = model.to(torch_device)
-            inputs = inputs.to(torch_device)
-        # run the model
-        outputs = model.forward(inputs)
-        # apply the final activation function (timm doesn't support doing this internally)
-        outputs = F.sigmoid(outputs)
-        # move inputs, outputs, and model back to to cpu if we were on GPU
-        if torch_device.type != "cpu":
-            inputs = inputs.to("cpu")
-            outputs = outputs.to("cpu")
-            model = model.to("cpu")
+    # with torch.inference_mode():
+    # move model to GPU, if available
+    if torch_device.type != "cpu":
+        model = model.to(torch_device)
+        inputs = inputs.to(torch_device)
+    # run the model
+    backbone_out =model.forward_features(inputs)
+    outputs = model.forward_head(backbone_out)
+    # apply the final activation function (timm doesn't support doing this internally)
+    outputs = F.sigmoid(outputs)
+
+    outputs_filtered_mask = outputs > 0.5
+    #TODO: multiple images
+    outputs_filtered = outputs[outputs_filtered_mask]
+    outputs_filtered_idx = torch.nonzero(outputs_filtered_mask[0], as_tuple=False).squeeze(1)
+    filtered_labels = [labels.names[outputs_filtered_idx[i]] for i in range(len(outputs_filtered_idx))]
+
+    eye = torch.eye(outputs_filtered.shape[0], device=torch_device)
+    gradients = torch.autograd.grad(outputs_filtered, backbone_out, is_grads_batched=True, grad_outputs=eye)
+    heatmap = (gradients[0].mean(2, keepdim=True) * backbone_out.unsqueeze(0)).squeeze().mean(-1).reshape(len(filtered_labels),28,28)
+    heatmap = heatmap.max(torch.zeros_like(heatmap))
+    heatmap /= heatmap.reshape(heatmap.shape[0],-1).max(-1)[0].unsqueeze(-1).unsqueeze(-1)
+    # heatmap =
+    heatmap_dir = Path("heatmaps") / image_path.stem
+    heatmap_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(len(filtered_labels)):
+        heatmap[i] = (heatmap[i] - heatmap[i].min()) / (heatmap[i].max() - heatmap[i].min())
+        cur_heatmap = F.interpolate(heatmap[i].unsqueeze(0).unsqueeze(0), size=(448,448), mode='bilinear').squeeze()
+        jet_heatmap_cv2 = cv2.applyColorMap((cur_heatmap * 255).detach().cpu().numpy().astype(np.uint8), cv2.COLORMAP_JET)
+        img_cv2 = cv2.cvtColor(((inputs/2+0.5)*255.0).squeeze().permute(1,2,0).cpu().numpy().astype(np.uint8), cv2.COLOR_RGB2BGR)
+        overlayed_img_cv2 = cv2.addWeighted(img_cv2, 0.5, jet_heatmap_cv2, 0.5, 0)
+        tag_name = filtered_labels[i]
+        if tag_name is not None:
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 1
+            font_color = (255, 255, 255)
+            thickness = 2
+            cv2.putText(overlayed_img_cv2, tag_name, (10, 30), font, font_scale, font_color, thickness, cv2.LINE_AA)
+            cv2.putText(overlayed_img_cv2, f"{outputs_filtered[i]:.3f}", (10, 60), font, font_scale, font_color, thickness, cv2.LINE_AA)
+        cv2.imwrite((heatmap_dir / f"{filtered_labels[i]}.png").as_posix(), overlayed_img_cv2)
+
+    # move inputs, outputs, and model back to to cpu if we were on GPU
+    if torch_device.type != "cpu":
+        inputs = inputs.to("cpu")
+        outputs = outputs.to("cpu").detach()
+
+        model = model.to("cpu")
+
+
 
     print("Processing results...")
     caption, taglist, ratings, character, general = get_tags(
