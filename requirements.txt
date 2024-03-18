@@ -7,6 +7,7 @@ numpy
 opencv-contrib-python-headless
 pandas
 pillow >= 9.5.0
+rich
 simple-parsing >= 0.1.5
 timm @ git+https://github.com/huggingface/pytorch-image-models@main#egg=timm
 tokenizers

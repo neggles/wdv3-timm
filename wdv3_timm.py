@@ -1,26 +1,47 @@
+import json
+import math
 from dataclasses import dataclass
+from os import PathLike, cpu_count
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TypeAlias
 
+import colorcet as cc
+import cv2
 import numpy as np
 import pandas as pd
 import timm
 import torch
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError
+from matplotlib.colors import LinearSegmentedColormap
 from PIL import Image
-from simple_parsing import field, parse_known_args
+from rich.traceback import install as traceback_install
+from simple_parsing import field, flag, parse_known_args
 from timm.data import create_transform, resolve_data_config
-from torch import Tensor, nn
+from timm.models import ConvNeXt, SwinTransformer, VisionTransformer
+from torch import Tensor
 from torch.nn import functional as F
-import cv2
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms as T
+from tqdm import tqdm
 
+_ = traceback_install(show_locals=True, locals_max_length=0)
+
+# Type aliases
+TaggerModel: TypeAlias = VisionTransformer | SwinTransformer | ConvNeXt
+
+# working dir, either file parent dir or cwd if interactive
+work_dir = (Path(__file__).parent if "__file__" in locals() else Path.cwd()).resolve()
+# pick torch device based on GPU availability
 torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# map model variants to their HF model repo id
 MODEL_REPO_MAP = {
     "vit": "SmilingWolf/wd-vit-tagger-v3",
     "swinv2": "SmilingWolf/wd-swinv2-tagger-v3",
     "convnext": "SmilingWolf/wd-convnext-tagger-v3",
 }
+# allowed input extensions
+IMAGE_EXTNS = [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".webp"]
 
 
 def pil_ensure_rgb(image: Image.Image) -> Image.Image:
@@ -35,13 +56,27 @@ def pil_ensure_rgb(image: Image.Image) -> Image.Image:
     return image
 
 
-def pil_pad_square(image: Image.Image) -> Image.Image:
-    w, h = image.size
-    # get the largest dimension so we can pad to a square
-    px = max(image.size)
-    # pad to square with white background
-    canvas = Image.new("RGB", (px, px), (255, 255, 255))
-    canvas.paste(image, ((px - w) // 2, (px - h) // 2))
+def pil_make_grid(
+    images: list[Image.Image],
+    max_cols: int = 5,
+    padding: int = 2,
+    bg_color: tuple[int, int, int] = (40, 42, 54),  # dracula background color
+) -> Image.Image:
+    n_cols = min(math.floor(math.sqrt(len(images))), max_cols)
+    n_rows = math.ceil(len(images) / n_cols)
+
+    # assumes all images are same size
+    image_width, image_height = images[0].size
+
+    canvas_width = ((image_width + padding) * n_cols) + padding
+    canvas_height = ((image_height + padding) * n_rows) + padding
+
+    canvas = Image.new("RGB", (canvas_width, canvas_height), bg_color)
+    for i, img in enumerate(images):
+        x = (i % n_cols) * (image_width + padding) + padding
+        y = (i // n_cols) * (image_height + padding) + padding
+        canvas.paste(img, (x, y))
+
     return canvas
 
 
@@ -104,127 +139,353 @@ def get_tags(
     combined_names.extend([x for x in char_labels])
 
     # Convert to a string suitable for use as a training caption
-    caption = ", ".join(combined_names)
-    taglist = caption.replace("_", " ").replace("(", "\(").replace(")", "\)")
+    caption = ", ".join(combined_names).replace("(", "\(").replace(")", "\)")
+    taglist = caption.replace("_", " ")
 
     return caption, taglist, rating_labels, char_labels, gen_labels
 
 
+@torch.no_grad()
+def render_heatmap(
+    image: Tensor,
+    gradients: Tensor,
+    image_feats: Tensor,
+    image_probs: Tensor,
+    image_labels: list[str],
+    image_path: Path,
+    output_dir: Path,
+    cmap: LinearSegmentedColormap = cc.m_linear_bmy_10_95_c71,
+    pos_embed_dim: int = 784,
+    image_size: tuple[int, int] = (448, 448),
+    font_args: dict = {
+        "fontFace": cv2.FONT_HERSHEY_SIMPLEX,
+        "fontScale": 1,
+        "color": (255, 255, 255),
+        "thickness": 2,
+        "lineType": cv2.LINE_AA,
+    },
+) -> tuple[list[tuple[float, str, Image.Image]], Image.Image]:
+    hmap_dim = int(math.sqrt(pos_embed_dim))
+
+    image_hmaps = gradients.mean(2, keepdim=True).mul(image_feats.unsqueeze(0)).squeeze()
+    image_hmaps = image_hmaps.mean(-1).reshape(len(image_labels), hmap_dim, hmap_dim)
+    image_hmaps = image_hmaps.max(torch.zeros_like(image_hmaps))
+
+    image_hmaps /= image_hmaps.reshape(image_hmaps.shape[0], -1).max(-1)[0].unsqueeze(-1).unsqueeze(-1)
+    # normalize to 0-1
+    image_hmaps = torch.stack([(x - x.min()) / (x.max() - x.min()) for x in image_hmaps]).unsqueeze(1)
+    # interpolate to input image size
+    image_hmaps = F.interpolate(image_hmaps, size=image_size, mode="bilinear").squeeze(1)
+
+    hmap_imgs = []
+    for tag, hmap, score in zip(image_labels, image_hmaps, image_probs.cpu()):
+        image_pixels = image.add(1).mul(127.5).squeeze().permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+        hmap_pixels = cmap(hmap.cpu().numpy(), bytes=True)[:, :, :3]
+
+        hmap_cv2 = cv2.cvtColor(hmap_pixels, cv2.COLOR_RGB2BGR)
+        hmap_image = cv2.addWeighted(image_pixels, 0.5, hmap_cv2, 0.5, 0)
+        if tag is not None:
+            cv2.putText(hmap_image, tag, (10, 30), **font_args)
+            cv2.putText(hmap_image, f"{score:.3f}", org=(10, 60), **font_args)
+
+        hmap_pil = Image.fromarray(cv2.cvtColor(hmap_image, cv2.COLOR_BGR2RGB))
+        hmap_imgs.append((score, tag, hmap_pil))
+
+    hmap_imgs = sorted(hmap_imgs, key=lambda x: x[0], reverse=True)
+    hmap_grid = pil_make_grid([x[-1] for x in hmap_imgs], max_cols=6, padding=4)
+
+    return hmap_imgs, hmap_grid
+
+
+def process_batch_heatmaps(
+    model: TaggerModel,
+    labels: LabelData,
+    images: Tensor,
+    paths: list[Path],
+    output_dir: Path,
+    threshold: float = 0.5,
+    suffix: str = ".txt",
+):
+    images_probs: list[Tensor] = []
+    images_labels: list[str] = []
+    images_grads: list[Tensor] = []
+
+    with torch.set_grad_enabled(True):
+        features = model.forward_features(images.to(torch_device))
+        probs = model.forward_head(features)
+        probs = F.sigmoid(probs)
+
+        for idx in range(probs.shape[0]):
+            probs_mask = probs[idx] > threshold
+            probs_filtered = probs[idx][probs_mask]
+            images_probs.append(probs_filtered)
+
+            label_indices = torch.nonzero(probs_mask, as_tuple=False).squeeze(1)
+
+            image_labels = [labels.names[label_indices[i]] for i in range(len(label_indices))]
+            images_labels.append(image_labels)
+
+        for idx, (image_probs, image_labels) in enumerate(zip(images_probs, images_labels)):
+            eye = torch.eye(image_probs.shape[0], device=torch_device)
+            grads = torch.autograd.grad(
+                outputs=image_probs,
+                inputs=features,
+                grad_outputs=eye,
+                is_grads_batched=True,
+                retain_graph=True,
+            )
+            # yeah this means i end up doing backward for the same batch multiple times. idk how to avoid that
+            image_grads = grads[0].detach().requires_grad_(False)[:, idx, :, :].unsqueeze(1)
+            images_grads.append(image_grads)
+
+    with torch.set_grad_enabled(False):
+        for idx, (image, grads) in enumerate(zip(images, images_grads)):
+            image_path = paths[idx]
+
+            hmap_dir = output_dir.joinpath(image_path.stem.rstrip(" _-"))
+            hmap_dir.mkdir(exist_ok=True, parents=True)
+
+            hmap_imgs, hmap_grid = render_heatmap(
+                image=image,
+                gradients=grads,
+                image_feats=features[idx],
+                image_probs=images_probs[idx],
+                image_labels=images_labels[idx],
+                image_path=image_path,
+                output_dir=output_dir,
+            )
+            for score, tag, hmap_pil in hmap_imgs:
+                hmap_pil.save(hmap_dir.joinpath(f"{image_path.stem}_{score:0.3f}_{tag}.png"))
+            hmap_grid.save(hmap_dir.joinpath(f"{image_path.stem}_heatmaps.png"))
+
+            caption, taglist, ratings, character, general = get_tags(
+                probs=probs[idx].cpu(),
+                labels=labels,
+                gen_threshold=threshold,
+                char_threshold=threshold,
+            )
+            meta_path = hmap_dir.joinpath(image_path.stem + "_tags" + suffix)
+            meta_path.write_text(taglist)
+            meta_path.with_suffix(".json").write_text(
+                json.dumps(
+                    {
+                        "caption": caption,
+                        "tags": taglist.split(", "),
+                        "rating": ratings,
+                        "general": general,
+                        "character": character,
+                    },
+                    indent=4,
+                    default=lambda x: x.tolist() if isinstance(x, np.ndarray) else str(x),
+                )
+            )
+
+
+@torch.inference_mode()
+def run_tagger(
+    model: TaggerModel,
+    labels: LabelData,
+    images: Tensor,
+    paths: list[Path],
+    output_dir: Path,
+    suffix: str = ".txt",
+    gen_threshold: float = 0.5,
+    char_threshold: float = 0.85,
+):
+    features = model.forward_features(images.to(torch_device))
+    probs = model.forward_head(features)
+    probs = F.sigmoid(probs).cpu()
+
+    for idx in range(probs.shape[0]):
+        caption, taglist, ratings, character, general = get_tags(
+            probs=probs[idx].cpu(),
+            labels=labels,
+            gen_threshold=gen_threshold,
+            char_threshold=char_threshold,
+        )
+        meta_path = output_dir.joinpath(paths[idx].stem + "_tags" + suffix)
+        meta_path.write_text(taglist)
+        meta_path.with_suffix(".json").write_text(
+            json.dumps(
+                {
+                    "caption": caption,
+                    "tags": taglist.split(", "),
+                    "rating": ratings,
+                    "general": general,
+                    "character": character,
+                },
+                indent=4,
+                default=lambda x: x.tolist() if isinstance(x, np.ndarray) else str(x),
+            )
+        )
+
+
+class ImageLoader(Dataset):
+    def __init__(
+        self,
+        images_path: PathLike,
+        transform: T.Compose,
+    ):
+        if not images_path.is_dir():
+            raise FileNotFoundError(f"Image directory {images_path} does not exist or is not a directory.")
+        self.images_path = Path(images_path)
+        self.transform = transform
+        self._preload()
+
+    def _preload(self):
+        self.image_files = [x for x in self.images_path.rglob("**/*") if x.suffix.lower() in IMAGE_EXTNS]
+
+    def __len__(self) -> int:
+        return len(self.image_files)
+
+    def __getitem__(self, idx: int | slice) -> dict[str, Tensor]:
+        img_path = self.image_files[idx]
+        image = Image.open(img_path)
+        image = pil_ensure_rgb(image)
+        image = self.transform(image)
+        # NCHW convert RGB to BGR (cursed openCV legacy nonsense)
+        image = image[[2, 1, 0]]
+        return {"image": image, "path": np.bytes_(str(img_path))}
+
+
 @dataclass
 class ScriptOptions:
-    image_file: Path = field(positional=True)
+    images_path: Path = field(positional=True)
+
     model: str = field(default="vit")
     gen_threshold: float = field(default=0.35)
     char_threshold: float = field(default=0.75)
 
+    tag_suffix: str = field(default=".txt")
+    batch_size: int = field(default=1)
+    num_workers: Optional[int] = field(default=None)
+
+    gradcam: bool = flag(default=False)
+    output_dir: Optional[Path] = field(default=None)
+
 
 def main(opts: ScriptOptions):
     repo_id = MODEL_REPO_MAP.get(opts.model)
-    image_path = Path(opts.image_file).resolve()
-    if not image_path.is_file():
-        raise FileNotFoundError(f"Image file not found: {image_path}")
+    images_path = Path(opts.images_path).resolve()
+    output_dir = Path(opts.output_dir).resolve() if opts.output_dir else None
+
+    if opts.gradcam is True and opts.model != "vit":
+        raise ValueError("GradCAM heatmaps are only supported for the ViT model")
 
     print(f"Loading model '{opts.model}' from '{repo_id}'...")
-    model = timm.create_model("hf-hub:" + repo_id, pretrained=True).eval()
+    if "model" not in locals():
+        model = timm.create_model("hf-hub:" + repo_id, pretrained=True).eval()
+    model = model.to(torch_device)
 
-    print("Loading tag list...")
+    print("Loading model's tag list...")
     labels: LabelData = load_labels_hf(repo_id=repo_id)
 
-    print("Creating data transform...")
-    model.pretrained_cfg['crop_mode'] = 'border'
+    print("Creating input image transform...")
+    model.pretrained_cfg["crop_mode"] = "border"
     transform = create_transform(**resolve_data_config(model.pretrained_cfg, model=model))
 
+    # handle images path
+    if images_path.is_dir():
+        # multi-file mode
+        print("Running in multi-image mode, preparing dataloader")
+        multi_file = True
+        # set output dir to ./heatmaps if using ./images, else to {images_path}/heatmaps
+        if images_path.resolve() == work_dir.joinpath("images").resolve():
+            # using the images folder so lets use the heatmaps one
+            if opts.output_dir is None:
+                output_dir = work_dir.joinpath("heatmaps")
+            else:
+                output_dir = images_path.joinpath("heatmaps")
 
-    print("Loading image and preprocessing...")
-    # get image
-    img_input: Image.Image = Image.open(image_path)
-    # ensure image is RGB
-    img_input = pil_ensure_rgb(img_input)
+        # load the dataset
+        dataset = ImageLoader(images_path=images_path, transform=transform)
 
-    # run the model's input transform to convert to tensor and rescale
-    inputs: Tensor = transform(img_input).unsqueeze(0)
+        # work out how many workers to use
+        if opts.num_workers is not None:
+            num_workers = opts.num_workers
+        else:
+            num_workers = cpu_count() if len(dataset) > 1000 else 0
+        print(f"Using {num_workers} dataloader workers")
 
+        # create the dataloader
+        batch_size = min(opts.batch_size, len(dataset))
+        inputs = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            num_workers=num_workers or 0,
+            shuffle=False,
+        )
 
-    print("Running inference...")
-    # with torch.inference_mode():
-    # move model to GPU, if available
-    if torch_device.type != "cpu":
-        model = model.to(torch_device)
-        inputs = inputs.to(torch_device)
-    # run the model
-    backbone_out =model.forward_features(inputs)
-    outputs = model.forward_head(backbone_out)
-    # apply the final activation function (timm doesn't support doing this internally)
-    outputs = F.sigmoid(outputs)
+    elif images_path.is_file():
+        # single file mode
+        print("Running in single-image mode, preprocessing image")
+        multi_file = False
+        # set the heatmap base dir dir if unset
+        output_dir = output_dir or images_path.parent.joinpath("heatmaps")
+        # get image
+        img_input: Image.Image = Image.open(images_path)
+        # ensure image is RGB
+        img_input = pil_ensure_rgb(img_input)
+        # run the model's input transform to convert to tensor and rescale
+        img_tensor = transform(img_input).unsqueeze(0)
+        # NCHW image RGB to BGR (cursed openCV legacy nonsense)
+        inputs = img_tensor[:, [2, 1, 0]]
+    else:
+        raise FileNotFoundError(f"Image file/folder '{images_path}' does not exist!")
 
-    outputs_filtered_mask = outputs > 0.5
-    #TODO: multiple images
-    outputs_filtered = outputs[outputs_filtered_mask]
-    outputs_filtered_idx = torch.nonzero(outputs_filtered_mask[0], as_tuple=False).squeeze(1)
-    filtered_labels = [labels.names[outputs_filtered_idx[i]] for i in range(len(outputs_filtered_idx))]
+    print(f"Will save heatmaps and tags in {output_dir}/")
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    eye = torch.eye(outputs_filtered.shape[0], device=torch_device)
-    gradients = torch.autograd.grad(outputs_filtered, backbone_out, is_grads_batched=True, grad_outputs=eye)
-    heatmap = (gradients[0].mean(2, keepdim=True) * backbone_out.unsqueeze(0)).squeeze().mean(-1).reshape(len(filtered_labels),28,28)
-    heatmap = heatmap.max(torch.zeros_like(heatmap))
-    heatmap /= heatmap.reshape(heatmap.shape[0],-1).max(-1)[0].unsqueeze(-1).unsqueeze(-1)
-    # heatmap =
-    heatmap_dir = Path("heatmaps") / image_path.stem
-    heatmap_dir.mkdir(parents=True, exist_ok=True)
-    for i in range(len(filtered_labels)):
-        heatmap[i] = (heatmap[i] - heatmap[i].min()) / (heatmap[i].max() - heatmap[i].min())
-        cur_heatmap = F.interpolate(heatmap[i].unsqueeze(0).unsqueeze(0), size=(448,448), mode='bilinear').squeeze()
-        jet_heatmap_cv2 = cv2.applyColorMap((cur_heatmap * 255).detach().cpu().numpy().astype(np.uint8), cv2.COLORMAP_JET)
-        img_cv2 = cv2.cvtColor(((inputs/2+0.5)*255.0).squeeze().permute(1,2,0).cpu().numpy().astype(np.uint8), cv2.COLOR_RGB2BGR)
-        overlayed_img_cv2 = cv2.addWeighted(img_cv2, 0.5, jet_heatmap_cv2, 0.5, 0)
-        tag_name = filtered_labels[i]
-        if tag_name is not None:
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 1
-            font_color = (255, 255, 255)
-            thickness = 2
-            cv2.putText(overlayed_img_cv2, tag_name, (10, 30), font, font_scale, font_color, thickness, cv2.LINE_AA)
-            cv2.putText(overlayed_img_cv2, f"{outputs_filtered[i]:.3f}", (10, 60), font, font_scale, font_color, thickness, cv2.LINE_AA)
-        cv2.imwrite((heatmap_dir / f"{filtered_labels[i]}.png").as_posix(), overlayed_img_cv2)
+    if multi_file:
+        print("Starting batch processing...")
+        for batch in tqdm(inputs, desc="Processing batch", unit="image", unit_scale=batch_size):
+            batch_paths = [Path(x.decode("utf-8")) for x in batch["path"]]
+            batch_images = batch["image"]
 
-    # move inputs, outputs, and model back to to cpu if we were on GPU
-    if torch_device.type != "cpu":
-        inputs = inputs.to("cpu")
-        outputs = outputs.to("cpu").detach()
-
-        model = model.to("cpu")
-
-
-
-    print("Processing results...")
-    caption, taglist, ratings, character, general = get_tags(
-        probs=outputs.squeeze(0),
-        labels=labels,
-        gen_threshold=opts.gen_threshold,
-        char_threshold=opts.char_threshold,
-    )
-
-    print("--------")
-    print(f"Caption: {caption}")
-    print("--------")
-    print(f"Tags: {taglist}")
-
-    print("--------")
-    print("Ratings:")
-    for k, v in ratings.items():
-        print(f"  {k}: {v:.3f}")
-
-    print("--------")
-    print(f"Character tags (threshold={opts.char_threshold}):")
-    for k, v in character.items():
-        print(f"  {k}: {v:.3f}")
-
-    print("--------")
-    print(f"General tags (threshold={opts.gen_threshold}):")
-    for k, v in general.items():
-        print(f"  {k}: {v:.3f}")
-
-    print("Done!")
+            if opts.gradcam:
+                process_batch_heatmaps(
+                    model=model,
+                    labels=labels,
+                    images=batch_images,
+                    paths=batch_paths,
+                    output_dir=output_dir,
+                    threshold=min(opts.gen_threshold, opts.char_threshold),
+                    suffix=opts.tag_suffix,
+                )
+            else:
+                run_tagger(
+                    model=model,
+                    labels=labels,
+                    images=batch_images,
+                    paths=batch_paths,
+                    output_dir=output_dir,
+                    suffix=opts.tag_suffix,
+                    gen_threshold=opts.gen_threshold,
+                    char_threshold=opts.char_threshold,
+                )
+    else:
+        print("Processing single image...")
+        if opts.gradcam:
+            process_batch_heatmaps(
+                model=model,
+                labels=labels,
+                images=inputs,
+                paths=[images_path],
+                output_dir=output_dir,
+                threshold=min(opts.gen_threshold, opts.char_threshold),
+                suffix=opts.tag_suffix,
+            )
+        else:
+            run_tagger(
+                model=model,
+                labels=labels,
+                images=inputs,
+                paths=[images_path],
+                output_dir=output_dir,
+                suffix=opts.tag_suffix,
+                gen_threshold=opts.gen_threshold,
+                char_threshold=opts.char_threshold,
+            )
 
 
 if __name__ == "__main__":
