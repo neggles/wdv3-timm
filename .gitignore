@@ -247,3 +247,7 @@ $RECYCLE.BIN/
 
 # but keep examples
 !*.example
+
+# input images and heatmap outputs
+/images/
+/heatmaps/
