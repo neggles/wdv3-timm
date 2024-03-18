@@ -58,8 +58,8 @@ def pil_ensure_rgb(image: Image.Image) -> Image.Image:
 
 def pil_make_grid(
     images: list[Image.Image],
-    max_cols: int = 5,
-    padding: int = 2,
+    max_cols: int = 8,
+    padding: int = 4,
     bg_color: tuple[int, int, int] = (40, 42, 54),  # dracula background color
 ) -> Image.Image:
     n_cols = min(math.floor(math.sqrt(len(images))), max_cols)
@@ -192,7 +192,7 @@ def render_heatmap(
         hmap_imgs.append((score, tag, hmap_pil))
 
     hmap_imgs = sorted(hmap_imgs, key=lambda x: x[0], reverse=True)
-    hmap_grid = pil_make_grid([x[-1] for x in hmap_imgs], max_cols=6, padding=4)
+    hmap_grid = pil_make_grid([x[-1] for x in hmap_imgs])
 
     return hmap_imgs, hmap_grid
 
