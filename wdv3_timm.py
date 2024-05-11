@@ -124,7 +124,7 @@ def main(opts: ScriptOptions):
         raise FileNotFoundError(f"Image file not found: {image_path}")
 
     print(f"Loading model '{opts.model}' from '{repo_id}'...")
-    model: nn.Module = timm.list_pretrained("hf-hub:" + repo_id).eval()
+    model: nn.Module = timm.create_model("hf-hub:" + repo_id).eval()
     state_dict = timm.models.load_state_dict_from_hf(repo_id)
     model.load_state_dict(state_dict)
 
